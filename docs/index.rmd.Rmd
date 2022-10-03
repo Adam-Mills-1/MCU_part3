@@ -1,0 +1,1158 @@
+---
+title: "MCU Box Office Analysis"
+output:
+  html_document:
+      code_folding: hide
+      df_print: paged
+      
+---
+
+```{r setup, include = FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, error = FALSE)
+
+```
+
+```{r, include = FALSE}
+
+# install Packages
+
+#install.packages("rvest")
+#install.packages("xml2") # scraping
+#install.packages("countrycode")
+
+```
+
+```{r, include = FALSE}
+
+library(rvest)
+library(xml2)
+library(tidyverse)
+library(gridExtra)
+library(lubridate)
+library(hrbrthemes)
+library(png)
+library(GGally)
+library(patchwork)
+library(viridis)
+library(ggrepel)
+library(scales)
+library(countrycode)
+library(sf)
+
+```
+
+```{r, include = FALSE}
+
+wiki_mcu <- read_html("https://en.wikipedia.org/wiki/List_of_Marvel_Cinematic_Universe_films")
+
+wiki_mcu %>% 
+  html_nodes(css = "table")
+
+```
+
+```{r, include = FALSE}
+
+mcu_table <- 
+  wiki_mcu %>% 
+  html_nodes(css = "table") %>% 
+  nth(6) %>% 
+  html_table(fill = TRUE)
+
+head(mcu_table) # Observe first few rows of data
+
+```
+
+```{r, include = FALSE}
+
+# Create data frame from scraped data
+
+mcu <- as.data.frame(mcu_table)
+
+
+# Remove refs column
+
+mcu <- mcu[,-9]
+
+
+# Set names of columns
+
+names(mcu) <- c('Film', 'US_release_date', 'Box_office_US_canada', 'Box_office_other', 'Box_office_world', 'Ranking_US_canada', 
+                       'Ranking_world', 'Budget')
+
+
+# Remove unnecessary rows
+
+mcu <- mcu %>%
+  filter(!row_number() %in% c(1, 2))
+
+
+# Change data type of date
+
+date <- as.Date(mcu$US_release_date, "%b %d, %Y")
+
+
+# Create new phase column
+
+mcu <- mcu %>% 
+  mutate(US_release_date = date) %>%
+  mutate(Phase =  ifelse (US_release_date < "2013-05-03", "1",
+      ifelse (US_release_date >= "2013-05-03" & US_release_date < "2016-05-06", "2",
+              ifelse (US_release_date >= "2016-05-06" & US_release_date < "2021-07-09", "3",
+                      ifelse (US_release_date >= "2021-07-09", "4", NA)))))
+
+
+# Remove original "phase" rows/ headers
+
+mcu <- mcu %>%                 
+  filter(!grepl('Phase', Film))
+
+    
+# Convert box office and budget strings to numeric
+
+mcu <- mcu %>%
+  mutate(across(contains("Box"), gsub, pattern = "[^0-9]", replacement = "")) %>% # Remove non numeric symbols 
+  mutate(across(contains("Box"), as.numeric)) %>%  # Convert to numeric
+  mutate(Budget = gsub("[a-z, $]", "", Budget)) # Remove letters and $ from Budget column
+
+
+Split <- str_split(mcu$Budget,"–|-") # Note: Have to account for 2 different hyphen characters
+Min_Budget <- sapply(Split, "[", 1)
+Max_Budget <- sapply(Split, "[", 2)
+
+
+
+for(i in 1:length(Max_Budget)){
+  ifelse(is.na(Max_Budget[i]) == TRUE, Max_Budget[i] <- Min_Budget[i] , Max_Budget[i] <- Max_Budget[i]) 
+} 
+
+
+mcu <- mcu %>%
+  mutate(Min_Budget = as.numeric(gsub("[^0-9.]", "", Min_Budget)) * 1000000) %>% # Convert to numeric 
+  mutate(Max_Budget = as.numeric(gsub("[^0-9.]", "", Max_Budget)) * 1000000) %>%
+  mutate(Ranking_US_canada = as.numeric(Ranking_US_canada)) %>%
+  mutate(Ranking_world = as.numeric(mcu$Ranking_world)) %>%
+  select(-Budget)
+
+
+mcu[nrow(mcu),"Min_Budget"] <- mcu[28,"Min_Budget"]*1000 #Convert total budgets to billions
+mcu[nrow(mcu),"Max_Budget"] <- mcu[28,"Max_Budget"]*1000
+
+
+# Add Year and Month columns
+
+mcu$Year <- year(as.POSIXlt(mcu$US_release_date, format = "%Y-%m-%d"))
+
+months <- c("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec")
+
+mcu$Month <- months[month(as.POSIXlt(mcu$US_release_date, format = "%Y-%m-%d"))]
+
+
+# Observe data
+
+glimpse(mcu)
+
+```
+
+```{r, include = FALSE}
+
+# Rotten tomatoes data
+
+site <- "https://editorial.rottentomatoes.com/guide/all-marvel-cinematic-universe-movies-ranked/"
+site <- read_html(site)
+
+scores <- html_nodes(site,".tMeterScore") #Used selector gadget via chrome extension
+scores <- html_text(scores)
+
+
+titles <- html_nodes(site,".article_movie_title a")
+titles <- html_text(titles)
+
+
+tomato <- data.frame(Film = titles, tomatometer = scores)
+
+
+
+# IMDB data
+
+site2 <- "https://www.imdb.com/list/ls093312123/?sort=list_order,asc&st_dt=&mode=detail&page=1&title_type=movie&ref_=ttls_ref_typ"
+site2 <- read_html(site2)
+
+scores2 <- html_nodes(site2,".ipl-rating-star.small .ipl-rating-star__rating") # Used selector gadget via chrome extension
+scores2 <- html_text(scores2)
+
+titles2 <- html_nodes(site2,".lister-item-header a")
+titles2 <- html_text(titles2)
+titles2 <- titles2[1:length(scores2)] # Some films may have no score if they are unreleased
+
+
+imdb <- data.frame(Film = titles2, IMDB = scores2)
+
+```
+
+```{r, include = FALSE}
+
+# Filter out sony films not contained in the mcu
+
+imdb <- imdb %>% 
+  filter(!str_detect(Film, "^Venom")) %>%
+  filter(!str_detect(Film, "Morbius")) 
+
+
+# Rename necessary films to make visualisations more readable and naming schemes consistent
+
+tomato$Film <- as.character(tomato$Film)
+
+tomato$Film[25] <- ("Multiverse of Madness") 
+tomato$Film[23] <- ("Age of Ultron")
+tomato$Film[21] <- ("Captain America")
+tomato$Film[15] <- ("Infinity War")
+tomato$Film[12] <- ("The Winter Soldier")
+tomato$Film[10] <- ("Far From Home")
+tomato$Film[8] <- ("The Avengers")
+tomato$Film[6] <- ("Homecoming")
+tomato$Film[9] <- ("Shang-Chi")
+tomato$Film[5] <- ("No Way Home")
+tomato$Film[2] <- ("Endgame")
+
+imdb$Film <- as.character(imdb$Film)
+
+imdb$Film[1] <- ("Endgame")
+imdb$Film[2] <- ("Infinity War")
+imdb$Film[9] <- ("Captain America")
+imdb$Film[10] <- ("The Winter Soldier")
+imdb$Film[11] <- ("Age of Ultron")
+imdb$Film[14] <- ("Homecoming")
+imdb$Film[15] <- ("No Way Home")
+imdb$Film[18] <- ("Shang-Chi")
+imdb$Film[19] <-("Multiverse of Madness")
+imdb$Film[24] <- ("Far From Home")
+imdb$Film[25] <- ("Iron Man 3")
+imdb$Film[26] <- ("Ant-Man and The Wasp")
+
+
+# Revert to factor
+
+imdb$Film <- as.factor(imdb$Film)
+tomato$Film <- as.factor(tomato$Film)
+
+
+# Create ratings dataset by merging rotten tomatoes scores and imdb scores
+
+Ratings <- merge(tomato, imdb, by = "Film") 
+
+
+# Shorten some of the titles in mcu dataset to match with the new names
+
+mcu$Film <- as.character(mcu$Film)
+
+
+mcu[2,1] <- "The Incredible Hulk"
+mcu[5,1] <- "Captain America"
+mcu[6,1] <- "The Avengers"
+mcu[9,1] <- "The Winter Soldier"
+mcu[11,1] <- "Age of Ultron"
+mcu[16,1] <- "Homecoming"
+mcu[19,1] <- "Infinity War"
+mcu[20,1] <- ("Ant-Man and The Wasp")
+mcu[22,1] <- "Endgame"
+mcu[23,1] <- "Far From Home"
+mcu[25,1] <- "Shang-Chi"
+mcu[27,1] <- "No Way Home"
+mcu[28,1] <- "Multiverse of Madness"
+
+# Revert to factor
+
+mcu$Film <- as.factor(mcu$Film)
+
+
+```
+
+```{r, include = FALSE}
+
+mcu <- merge(Ratings, mcu, by = "Film") %>%
+  arrange(US_release_date)
+
+```
+ 
+```{r, include = FALSE}
+
+Approx_budget <- ((mcu$Max_Budget + mcu$Min_Budget)/2)
+
+mcu$Approx_budget <- Approx_budget
+
+```
+
+```{r, include = FALSE}
+
+mcu$Approx_profit <- mcu$Box_office_world-mcu$Approx_budget
+
+```
+
+```{r, include = FALSE}
+
+mcu <- mcu %>%
+  select( - c(Box_office_US_canada, Box_office_other, Ranking_world, Ranking_US_canada ))
+
+
+```
+
+```{r, include = FALSE}
+# Save mcu
+
+saveRDS(mcu, file = "mcu.rds")
+
+mcu <- readRDS(file = "mcu.rds")
+
+mcu
+
+```
+
+```{r, include = FALSE}
+
+ggplot(data = mcu, aes(US_release_date, Box_office_world))+
+  geom_point()+
+  geom_label_repel(label = mcu$Film, size = 3)+
+  scale_y_continuous(labels = unit_format(unit = "B", scale = 1e-9, accuracy = 0.5))+
+  theme_minimal()+ scale_y_continuous(breaks = seq(0, 3000000000, by = 500000000), 
+                     labels = c(0,"500 M", "1 B", "1.5 B", "2 B", "2.5 B", "3 B"))+
+  theme_minimal()
+
+
+```
+
+```{r, include = FALSE}
+
+ggplot(data = mcu, aes(x = reorder(Film, -Box_office_world), y = Box_office_world))+
+  geom_bar(stat = "identity", fill = "#00BFC4")+
+  scale_y_continuous(labels = unit_format(unit = "B", scale = 1e-9, accuracy = 0.5))+
+  scale_y_continuous(breaks = seq(0, 3000000000, by = 500000000), 
+                     labels = c(0,"500 M", "1 B", "1.5 B", "2 B", "2.5 B", "3 B"))+
+  ylab("Box Office")+
+  xlab("US release date")+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  theme(axis.title.x=element_blank()) 
+  
+
+```
+
+```{r, include = FALSE}
+
+ggplot(data = mcu, aes(x = US_release_date ))+
+  geom_line(aes(y= Box_office_world, color = "Box_office_world"))+
+  geom_line(aes(y = Max_Budget, color = "Max_Budget"))+
+  geom_line(aes(y = Min_Budget, color = "Min_Budget"))+
+  scale_colour_manual("", 
+                      breaks = c("Box_office_world", "Max_Budget", "Min_Budget"),
+                      values = c("black", "red", "orange"))+
+  scale_y_continuous(labels = unit_format(unit = "B", scale = 1e-9, accuracy = 0.5))+
+  theme_minimal()+ scale_y_continuous(breaks = seq(0, 3000000000, by = 500000000), 
+                     labels = c(0,"500 M", "1 B", "1.5 B", "2 B", "2.5 B", "3 B"))+
+  theme(axis.title.y = element_blank())+
+  xlab("US Release Date")
+  
+  
+  
+```
+
+```{r, include = FALSE}
+
+  
+ggplot(data = mcu, aes(x = reorder(Film, US_release_date), y = Approx_profit))+
+  geom_bar(stat = "identity", fill = "#00BFC4")+
+  scale_y_continuous(labels = unit_format(unit = "B", scale = 1e-9, accuracy = 0.5))+
+  scale_y_continuous(breaks = seq(0, 2000000000, by = 500000000), 
+                     labels = c(0,"500 M", "1 B", "1.5 B", "2 B"))+
+  ylab("Estimated profit")+
+  xlab("US release date")+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  theme(axis.title.x=element_blank()) 
+
+
+
+```
+
+```{r, include = FALSE}
+
+# Create a more realistic profit estimate
+
+mcu$Approx_profit_2 <- mcu$Approx_profit - mcu$Approx_budget
+
+
+# Create a column to check if the release has made or lost money
+
+mcu$In_profit <- ifelse(mcu$Approx_profit_2 > 0, "Yes", "No")
+
+```
+
+```{r, include = FALSE}
+  
+ggplot(data = mcu, aes(x = reorder(Film, US_release_date), y = Approx_profit_2))+
+  geom_bar(stat = "identity", aes(fill = In_profit))+
+  scale_y_continuous(labels = unit_format(unit = "B", scale = 1e-9, accuracy = 0.5))+
+  scale_y_continuous(breaks = seq(0, 2000000000, by = 500000000), 
+                     labels = c(0,"500 M", "1 B", "1.5 B", "2 B"))+
+  ylab("Estimated profit")+
+  xlab("US release date")+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  theme(axis.title.x=element_blank()) 
+
+
+
+```
+
+```{r, include = FALSE}
+
+summary(mcu$Approx_profit_2)
+
+var(mcu$Approx_profit_2)
+
+```
+
+```{r, include = FALSE}
+
+# Read rotten tomatoes image
+
+# Rotten_tomato_image <- readPNG("C:/Users/Adam/Dropbox/Portfolio/MCU_box_office_analysis_files/Rotten_tomatoes.png", native = TRUE)
+
+mcu$tomatometer <- as.numeric(sub("%","",mcu$tomatometer))/100
+
+
+
+ ggplot(data = mcu, aes(x = reorder(Film, -as.numeric(tomatometer)), y = tomatometer))+
+  geom_bar(stat = "identity", fill = "red")+
+      theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  theme(axis.title.x=element_blank())+
+   scale_y_continuous(NULL, limits = c(0, 1.0), breaks = seq(0, 1, .2),
+                        labels = function(x) scales::percent(x),
+                        expand = c(0, 0))+
+      geom_text(aes(label = paste0(tomatometer*100,"%")),
+                size = 5, 
+                hjust = 1.2,
+                col = "white",
+                angle = 90)
+  # inset_element(p = Rotten_tomato_image,   # Combine with image
+  #               left = 0.85,
+  #               bottom = 0.75,
+  #               right = 1,
+  #               top = 1)
+
+  
+
+```
+
+```{r, include = FALSE}
+
+ # ggplot(data = mcu, aes(x = reorder(Film, US_release_date), y = tomatometer, group = 1))+
+ #  geom_line(color = "#00BFC4")+
+ #   expand_limits(y = c(0,1))+
+ #   geom_text(aes(label = percent(tomatometer)),
+ #                   size = 3, vjust = -0.01) +
+ #   scale_y_continuous(NULL, limits = c(0, 1.0), breaks = seq(0, 1, .2),
+ #                        labels = function(x) scales::percent(x),
+ #                        expand = c(0, 0)) +
+ #  theme_minimal()+
+ #  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+ #  theme(axis.title.x=element_blank())
+
+```
+
+```{r, include = FALSE}
+
+ # ggplot(data = mcu, aes(x = reorder(Film, US_release_date), y = tomatometer, group = 1))+
+ #  geom_line(color = "#00BFC4")+
+ #   expand_limits(y = c(0,1))+
+ #   scale_y_continuous(NULL, limits = c(0, 1.0), breaks = seq(0, 1, .2),
+ #                        labels = function(x) scales::percent(x),
+ #                        expand = c(0, 0)) +
+ #  geom_label_repel(aes(label = percent(tomatometer)), nudge_x = 0.35, size = 2.5)+
+ #  theme_minimal()+
+ #  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+ #  theme(axis.title.x=element_blank())#Remove x axis label
+
+
+
+
+```
+
+```{r, include = FALSE}
+
+# Read IMDB image
+
+# IMDB_logo <- readPNG("C:/Users/Adam/Dropbox/Portfolio/MCU_box_office_analysis_files/IMDB_logo.png", native = TRUE)
+
+
+mcu$IMDB <- as.double(as.character(mcu$IMDB))
+
+
+
+
+ggplot(data = mcu, aes(x = reorder(Film, -IMDB), y = IMDB))+
+  geom_bar(stat = "identity", fill = "orange")+
+  expand_limits(y = c(0,10))+
+  ylab("Score")+
+  geom_text(aes(label = IMDB), 
+            hjust = 1.5, 
+            colour = "white",
+            size = 5,
+            angle = 90)+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        axis.title.x=element_blank())
+  # inset_element(p = IMDB_logo,   # Combine with image
+  #               left = 0.6,
+  #               bottom = 0.7,
+  #               right = 1.1,
+  #               top = 1.1)
+
+```
+
+```{r, include = FALSE}
+
+
+ggplot(mcu, aes(x = reorder(Film, US_release_date))) +
+  geom_line( aes(y = tomatometer, group = 1), color = "Red") + 
+  geom_line( aes(y = IMDB / 10, group = 1), color = "orange") + 
+  scale_y_continuous(name = "Tomatometer", labels = function(x) scales::percent(x), sec.axis = sec_axis(~.*10, name="IMDB score"))+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)
+        ,axis.title.y = element_text(color = "red", size=13, vjust = 3)
+        ,axis.title.y.right = element_text(color = "orange", size=13, vjust = 3))+
+  theme(axis.title.x=element_blank())
+  
+```
+
+```{r, include = FALSE}
+
+summary(mcu$tomatometer)
+
+```
+
+```{r, include = FALSE}
+
+summary(mcu$IMDB)
+
+```
+
+```{r, include = FALSE}
+
+ggplot(mcu, aes(x = reorder(Film, US_release_date))) +
+  
+    geom_col( aes(y = Box_office_world, group = 1), fill = "#00BFC4")+
+  geom_line( aes(y = tomatometer*2000000000 , group = 1), color = "Red") +
+  
+  scale_y_continuous( name = "Box office", breaks = seq(0, 3000000000, by = 500000000), 
+                     labels = c(0,"500 M", "1 B", "1.5 B", "2 B", "2.5 B", "3 B"),
+                     sec.axis = sec_axis(~./2000000000, name = "Tomatometer", labels = function(x) scales::percent(x)))+
+  
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)
+        ,axis.title.y = element_text(color = "#00BFC4", size=13)
+        ,axis.title.y.right = element_text(color = "red", size=13, vjust = 3))+
+  theme(axis.title.x=element_blank())
+
+
+```
+
+```{r, include = FALSE}
+
+cor(mcu$Box_office_world, mcu$tomatometer)
+
+```
+
+```{r, include = FALSE}
+
+ggplot(mcu, aes(x = reorder(Film, US_release_date))) +
+  
+    geom_col( aes(y = Box_office_world, group = 1), fill = "#00BFC4")+
+  geom_line( aes(y = IMDB*200000000 , group = 1), color = "orange") +
+  
+  scale_y_continuous( name = "Box office", breaks = seq(0, 3000000000, by = 500000000), 
+                     labels = c(0,"500 M", "1 B", "1.5 B", "2 B", "2.5 B", "3 B"),
+                     sec.axis = sec_axis(~./200000000, name = "IMDB"))+
+  
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)
+        ,axis.title.y = element_text(color = "#00BFC4", size=13)
+        ,axis.title.y.right = element_text(color = "orange", size=13))+
+  theme(axis.title.x=element_blank())
+
+```
+
+```{r, include = FALSE}
+
+cor(mcu$Box_office_world, mcu$IMDB)
+
+```
+
+```{r, include = FALSE}
+
+phase <- data.frame(start = as.Date(c("2008-05-02", "2013-05-03", "2016-05-06", "2021-07-09"), format =  "%Y-%m-%d"),  
+                    end = as.Date(c("2013-05-03", "2016-05-06", "2021-07-09", "2023-02-01"), format = "%Y-%m-%d"),
+                    Phase = factor(1:4))
+
+phase
+
+
+```
+
+```{r, include = FALSE}
+mcu$cumu_profits <- cumsum(mcu$Approx_profit_2)
+
+```
+
+```{r, include = FALSE}
+
+ggplot() + 
+  geom_rect(data = phase,  aes(xmin=start, xmax = end, 
+                 ymin = -Inf, ymax = Inf, 
+                 fill = Phase), alpha = 0.5)+
+  scale_fill_viridis(discrete = TRUE, option = "C")+
+  geom_point(data = mcu, aes(US_release_date, cumu_profits))+
+  geom_line(data = mcu, aes(US_release_date, cumu_profits))+
+  scale_y_continuous(labels = unit_format(unit = "B", scale = 1e-10, accuracy = 0.5))+
+  scale_y_continuous(breaks = seq(0, 20000000000, by = 5000000000), 
+                     labels = c(0,"5 B", "10 B", "15 B", "20 B"))+
+  ylab("Cummulative profits")+
+  xlab("US release date")+
+  theme_minimal()
+  
+```
+
+```{r, include = FALSE}
+
+mcu_year <- mcu %>% 
+              group_by(Year) %>%
+              summarise(Mean_box_office = mean(Box_office_world))
+
+mcu_month <- mcu %>% 
+              group_by(Month) %>%
+              summarise(Mean_box_office = mean(Box_office_world))
+
+
+mcu_year; mcu_month
+
+
+```
+
+```{r, include = FALSE}
+
+Releases_per_year <- ggplot(data = (mcu %>%count(Year)), aes(x = Year, y = n) )+
+                      geom_bar(stat = "identity", fill = "#00BFC4")+
+                        scale_x_continuous(breaks=2008:2022)+
+                        theme_minimal()+
+                        ggtitle("Releases per year")+
+                        theme(plot.title = element_text(hjust = 0.5),
+                        axis.title.y = element_blank(),
+                        axis.text.y = element_blank(),
+                        axis.title.x = element_blank(),
+                        plot.margin = unit(c(1,-1,1,0), "mm"))+
+                        scale_y_reverse()+
+                        coord_flip()
+
+
+Mean_box_ofice_year <- ggplot(data = mcu_year, aes(x = Year, y = Mean_box_office))+
+                        geom_bar(stat = "identity", fill = "#00BFC4")+                        
+                        scale_x_continuous(breaks=2008:2022)+
+                        scale_y_continuous(labels = unit_format(unit = "B", scale = 1e-9, accuracy = 0.5))+
+                        scale_y_continuous(breaks = seq(0, 3000000000, by = 500000000), 
+                                           labels = c(0,"500 M", "1 B", "1.5 B", "2 B", "2.5 B", "3 B"))+
+                        ylab("Box Office")+
+                        theme_minimal()+
+                        ggtitle("Mean box ofice per year") +
+                        theme(plot.title = element_text(hjust = 0.5),
+                        axis.title.x = element_blank(),
+                        axis.title.y = element_blank(),
+                        plot.margin = unit(c(1,-1,1,0), "mm"))+
+                        coord_flip()
+
+
+grid.arrange(Releases_per_year, Mean_box_ofice_year, ncol = 2)
+
+```
+
+```{r, include = FALSE}
+
+month_count <- mcu %>% count(Month)
+               
+
+month_count
+
+# Create abreviated month data frame 
+
+month_abv <- data.frame(Month = c("Jan","Feb","Mar","Apr","May","Jun", "Jul","Aug","Sep","Oct", "Nov", "Dec"))
+
+
+# Add missing months 
+
+month_modified <- left_join(month_abv, month_count, by = "Month") 
+
+ 
+# Replace coerced NAs with 0 
+
+month_modified <- month_modified %>%
+  mutate(n = ifelse(is.na(n),0,n)) %>%
+  mutate(Month = factor(Month, levels = c("Jan","Feb","Mar","Apr","May","Jun", "Jul","Aug","Sep","Oct", "Nov", "Dec")))
+
+
+# Create plot
+
+month_plot <- ggplot(month_modified, aes(x = Month, y = n)) +
+                geom_bar(stat = "identity", fill = "#00BFC4")+
+                scale_y_reverse()+
+                ggtitle("Releases per month")+
+                theme_minimal()+
+                theme(plot.title = element_text(hjust = 0.5),
+                      axis.title.y = element_blank(),
+                      axis.text.y = element_blank(),
+                      axis.title.x = element_blank())+
+                coord_flip() +
+                scale_y_reverse()
+
+
+```
+
+```{r, include = FALSE}
+
+# Add missing months 
+
+month_modified_mean <- left_join(month_abv, mcu_month, by = "Month") 
+
+# Replace coerced NAs with 0 
+
+month_modified_mean <- month_modified_mean %>%
+  mutate(Mean_box_office = ifelse(is.na(Mean_box_office),0,Mean_box_office)) %>%
+  mutate(Month = factor(Month, levels = c("Jan","Feb","Mar","Apr","May","Jun", "Jul","Aug","Sep","Oct", "Nov", "Dec")))
+
+
+# Create plot
+
+month_mean_plot <- ggplot(month_modified_mean, aes(x = Month, y = Mean_box_office)) +
+                geom_bar(stat = "identity", fill = "#00BFC4")+
+                ggtitle("Mean box office")+
+                        scale_y_continuous(labels = unit_format(unit = "B", scale = 1e-9, accuracy = 0.5))+
+                        scale_y_continuous(breaks = seq(0, 3000000000, by = 500000000), 
+                                           labels = c(0,"500 M", "1 B", "1.5 B", "2 B", "2.5 B", "3 B"))+
+                theme_minimal()+
+                theme(plot.title = element_text(hjust = 0.5),
+                      axis.title.y = element_blank(),
+                      axis.title.x = element_blank())+
+                coord_flip()
+
+
+            
+
+```
+
+
+
+## Part 3 - Box office of Endgame by country
+
+$$\\[0.2in]$$
+
+In part 3, we will examine the box office returns of the highest grossing MCU film "Avengers: Endgame" (2019) as it relates to the countries it was released in. The data we use here is available on boxofficemojo.com and contains the film's release date, the market (i.e. the country it was released in), the earning over the opening weekend the gross earnings at the box office.
+
+Firstly, the data is collected and cleaned.
+
+
+```{r class.source = 'fold-show',eval = FALSE}
+
+# Scrape multiple tables 
+
+library(rvest)
+
+url <- "https://www.box officemojo.com/releasegroup/gr3511898629/"
+
+endgame <- url %>%
+  read_html() %>%
+  html_nodes("table") %>%
+  html_table(fill = TRUE)
+
+
+# Convert list of dataframes into a single dataframe
+
+endgame <- bind_rows(endgame)
+
+
+endgame[3:nrow(endgame), 1:16] <- endgame[3:nrow(endgame), 5:ncol(endgame)]
+
+endgame[36:nrow(endgame), 1:16] <- endgame[36:nrow(endgame), 5:ncol(endgame)]
+
+endgame[46:nrow(endgame), 1:16] <- endgame[46:nrow(endgame), 5:ncol(endgame)]
+
+endgame[61:nrow(endgame), 1:16] <- endgame[61:nrow(endgame), 5:ncol(endgame)]
+
+endgame[,5:ncol(endgame)] <- NULL
+
+
+# Rename column names
+
+names(endgame) <- c('Market', 'Release Date', 'Opening', 'Gross')
+
+
+# Clean up dataframe
+
+endgame <- endgame %>%
+  filter(!Market %in% c("Market") 
+         & !`Release Date` %in% c("Release Date"))     # Note: `` allows indexing column with a space in name
+
+
+# Convert box office to numeric
+
+endgame$Gross <- as.numeric(gsub('[$,]', '', endgame$Gross))
+endgame$Opening <- as.numeric(gsub('[$,]', '', endgame$Opening))
+
+
+# Change some country names to match with map data 
+
+library(sf)
+library("rnaturalearth")
+library("rnaturalearthdata")
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+endgame$Market[which(!(endgame$Market %in% world$name))]
+
+endgame$Market[1] <- "United States"
+endgame$Market[6] <- "Czech Rep." 
+endgame$Market[23] <- "Serbia"
+endgame$Market[30] <- "Turkey"
+endgame$Market[51] <- "Russia"
+endgame$Market[53] <- "Korea"
+
+
+# Add regions
+
+library(countrycode)
+
+endgame$Region <- countrycode(sourcevar = as.factor(endgame$Market), origin = "country.name", destination = "region")
+
+
+# Rename United States to include Canada
+
+endgame$Market[1] <- "United States & Canada"
+
+
+# Remove release date from data frame
+
+endgame <- endgame %>%
+  select(-"Release Date")
+
+```
+
+Save and observe data
+
+```{r}
+
+# Save endgame
+#saveRDS(endgame, file = "endgame.rds")
+
+endgame <- readRDS(file = "endgame.rds")
+
+endgame
+
+```
+
+$$\\[0.5in]$$
+
+We will take an initial look at the gross earnings over various regions.
+
+
+```{r}
+
+ggplot(endgame, aes(x = reorder(Region, Gross), y = Gross))+
+  geom_point()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  labs(x = NULL)+
+  coord_flip()+ 
+  scale_y_continuous(labels = unit_format(unit = "M", scale = 1e-8, accuracy = 0.5))+
+  scale_y_continuous(breaks = seq(0, 1000000000, by = 200000000), 
+                     labels = c(0,"200 M", "400 M", "600 M", "800 M", "1 B"))+
+  theme_minimal()
+
+```
+
+$$\\[0.2in]$$
+
+Clearly the regions "North America" and "East Asia & Pacific" account for a large amount of the earnings. "North America" only has one data point as the box office of Canada is included in the domestic box office for North America. In the case of East Asia, we observe an outlier bringing in over $600 million, considerably more than the other countries in the region. The Middle East, North Africa and Sub-Saharan Africa appear to have generated the least money for the film.
+
+$$\\[0.5in]$$
+
+Let's examine which specific countries have taken in the most money for the film. For example, the top 20 earners.
+
+```{r}
+
+#Top 20 box offices
+
+# Create magma colour palette
+
+mag_pal <- viridis(n = 7)
+
+cols <- c("North America" = mag_pal[1], "East Asia & Pacific" = mag_pal[2], "Europe & Central Asia" = mag_pal[3], "Latin America & Caribbean" = mag_pal[4], "South Asia" = mag_pal[5], "Middle East & North Africa" = mag_pal[6], "Sub-Saharan Africa" = mag_pal[7])
+
+
+# Select top 20 performing countries
+
+endgame_1 <- arrange(endgame, -Gross)[1:20,]
+
+endgame_1
+
+```
+
+$$\\[0.2in]$$
+
+We will also calculate the combined earnings of the top two performing countires as a percentage of the whole: 
+
+```{r}
+
+# % of US and China together
+
+(sum(endgame_1$Gross[1:2])/sum(endgame_1$Gross)) * 100
+
+
+```
+
+
+
+```{r}
+
+ggplot(endgame_1, aes(x = reorder(Market, Gross), y = Gross, fill = Region))+
+  geom_col()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  scale_y_continuous(labels = unit_format(unit = "M", scale = 1e-8, accuracy = 0.5))+
+  scale_y_continuous(breaks = seq(0, 1000000000, by = 200000000), 
+                     labels = c(0,"200 M", "400 M", "600 M", "800 M", "1 B"))+
+  scale_fill_manual(values = cols)+
+  theme_minimal()+
+  labs(x = NULL)+
+  coord_flip()+
+  ggtitle("Top 20 countries")
+
+```
+$$\\[0.5in]$$
+
+Here we note two standout countries where the film performed the best, namely the United States where it brought in over $850 million and China with just under $630 million. These two countries alone are responsible for 60.43% of Endgame's box_office earnings.
+
+They are followed by the UK ($115 million), Korea($105 million) and Brazil ($85 million).
+
+Countires in the regions of "Middle east & North Africa" and "Sub-Saharan Africa" are not included in the list of top 20 earners.
+
+
+$$\\[0.5in]$$
+
+When we divide the Gross earnings by region we observe that East Asia and the pacific take in the most money, followed by North America as expected.
+
+```{r}
+
+# Group data by region
+
+endgame_3 <- endgame %>%
+  group_by(Region) %>%
+  summarise(Gross = sum(Gross)) %>%
+  arrange(-Gross)
+
+# Observe data
+
+endgame_3
+
+```
+
+$$\\[0.5in]$$
+
+```{r}
+
+# Visualise this data
+
+# Calculate polar coordinates for piechart labels
+
+df <- endgame_3 %>% 
+  arrange(Gross) %>%
+  mutate(csum = rev(cumsum(rev(Gross))), 
+         pos = Gross/2 + lead(csum, 1),
+         pos = if_else(is.na(pos), Gross/2, pos))
+
+
+# Create plot
+
+ggplot(endgame_3, aes(x="", y = Gross, fill = reorder(Region, Gross))) + #Reorder - piechart goes from highest value to lowest clockwise
+  geom_bar(stat="identity", width = 1, color = "white")+
+  ggtitle("Gross by Region")+
+  coord_polar("y", start=0) +
+  geom_label_repel(data = df,
+                   aes(y = pos, label = paste0(round(Gross / sum(Gross) * 100, 1), "%")),
+                   size = 5, nudge_x = 1, show.legend = FALSE, color = "darkorange") +
+  scale_fill_manual(values = cols)+
+  theme_void()+
+  theme(plot.title = element_text(hjust = 0.5, vjust = 3)) +
+  guides(fill = guide_legend(title = "Region")) 
+
+
+```
+
+$$\\[0.5in]$$
+
+Taking a closer look at East Asia and the Pacific, unsurprisingly it seems that it is China that accounts for the majority of box office earnings.
+
+```{r}
+
+endgame_Asia <- endgame %>% 
+                filter(Region == "East Asia & Pacific")%>%
+                arrange(-Gross) %>%
+                select(Market, Gross) 
+
+endgame_Asia
+
+ggplot(endgame_Asia, aes(reorder(Market, -Gross), Gross))+
+  geom_bar(stat = "identity")+
+  geom_col(fill = "#00BFC4")+
+  theme_minimal()+
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank())+
+  scale_y_continuous(labels = unit_format(unit = "M", scale = 1e-8, accuracy = 0.5))+
+  scale_y_continuous(breaks = seq(0, 1000000000, by = 200000000), 
+                     labels = c(0,"200 M", "400 M", "600 M", "800 M", "1 B"))+
+  ggtitle("East Asia & Pacific")
+
+
+```
+
+
+$$\\[0.5in]$$
+
+To get a better sense of the geographical data available to us, we can visualise the endgame dataset on a world map. Here countries with available data are highlighted. Once again, note that the Canadian box office is contained in the domestic box office for North America.
+
+
+```{r class.source = 'fold-show', paged.print=FALSE}
+
+# Generate simple feature collection for visualisation
+
+library("sf")
+library("rnaturalearth")
+library("rnaturalearthdata")
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+# Combine geometry of Canada and USA to create "North America"
+
+North_America <- world %>%
+ filter(name == "Canada" | name == "United States") %>%
+  st_combine()
+
+data <- data.frame(name = "United States & Canada", subregion = "North America")
+
+North_America_2 <- st_sf(data, geometry = North_America)
+
+
+# Observe data
+
+North_America_2
+
+
+sfc <- world %>%
+  select(name, geometry, subregion) 
+
+sfc <- rbind(sfc, North_America_2)
+
+
+# Observe data 
+
+sfc
+
+
+world_joined <- sfc %>%
+  left_join(endgame, by = c("name" = "Market"))%>%
+  filter(name != "Antarctica")
+
+```
+
+```{r}
+
+# Create heat map of profits
+
+ggplot() + 
+ geom_sf(data = world_joined, aes(fill = Gross))+
+ ggtitle("Gross by country") +
+ theme(axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        rect = element_blank())+
+ scale_fill_continuous(name = "Gross", breaks = seq(0, 1000000000, by = 250000000), 
+ labels = c(0,"250 M", "500 M", "750 M", "1 B"))
+
+```
+
+Generating a heat map based on box office performance again highlights the dominance of North America and China, it also allows us to see at a glance the countries that were included and excluded from the data.
+
+
+$$\\[0.5in]$$
+
+Our data  not only contains the gross box office by country but also the money made over the film's opening weekend. Studios and critics will often emphasize the importance of a strong opening weekend as it is a good indication of how well the movie will perform over its run.
+
+We will visualise how the opening performance of the film compares to it's overall box office. 
+
+```{r}
+
+# Create dataset using pivot_longer
+
+endgame_2 <- endgame_1 %>%
+  select(Market, Opening, Gross) %>%
+  mutate("Remaining" = Gross - Opening ) %>%
+  pivot_longer(cols = c("Opening", "Remaining"), names_to = "Box_Office", values_to = "Amount") %>%
+  na.omit() # Revove Hong Kong and Korea where opening is unavailable
+  
+ 
+# Observe data
+
+ endgame_2
+
+
+# Create plot
+ 
+ggplot(endgame_2, aes(x = reorder(Market, Gross), y = Amount, fill = forcats::fct_rev(Box_Office)))+ #forcats::fct_rev places "Opening" at the left 
+  geom_bar(position = "fill", stat = "identity")+
+  ggtitle("Opening & Remaining Box Office")+
+  scale_y_continuous(labels = scales::percent)+
+  theme_minimal()+
+  labs(x = NULL)+
+  geom_text(aes(label = paste0(round((Amount/Gross)*100,2),"%")),
+                size = 4, 
+                position = position_fill(vjust = 0.4), 
+                col = "white")+
+  coord_flip()+
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank(),
+        legend.title = element_blank())
+
+
+
+```
+
+$$\\[0.2in]$$
+
+Interestingly, a significant proportion of the overall box office appears to come from the opening weekend alone.
+
+In the case of the United States, 41.6% of the earnings were obtained in this short time period. In the UK, the third highest performing country, Endgame brought in just under 49% of it's gross over the opening. 
+
+The film was screened in cinemas in North America from April 26th to September 12th (140 days), meaning it brought in 41.6% of it's money only 2.14% (three days) of the way into it's total run.
+
+Even the lowest opening percentage - Japan, still accounts for almost a quarter(23.83%) of the total box office. As such, this plot helps underline the importance of a solid opening for a blockbuster movie. 
+
+Note that Korea and Hong Kong have been omitted here as the data for their opening weekend box office was unavailable
+
+
+
+
+$$\\[1.5in]$$
+
+
+
+
+
+
